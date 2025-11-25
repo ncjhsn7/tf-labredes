@@ -17,7 +17,6 @@ stats = {
     "packets_captured": 0,
     "protocols": {"IPv4": 0, "IPv6": 0, "ICMP": 0, "TCP": 0, "UDP": 0, "Other": 0},
     "app_protocols": {"HTTP": 0, "DNS": 0, "DHCP": 0, "NTP": 0, "Other": 0},
-    # Armazena dados por IP de cliente da rede tunel (172.31.66.xxx)
     "clients": {} 
 }
 
@@ -48,6 +47,7 @@ def get_ipv6(addr):
 # --- Parsing de Camadas ---
 
 def ethernet_frame(data):
+    # Unpack header to remove the first 14 bytes (ETH Header)
     dest_mac, src_mac, proto = struct.unpack('! 6s 6s H', data[:14])
     return socket.htons(proto), data[14:]
 
@@ -58,7 +58,6 @@ def ipv4_packet(data):
     return proto, get_ipv4(src), get_ipv4(target), data[header_length:]
 
 def ipv6_packet(data):
-    # Parsing do cabeçalho IPv6 (40 bytes fixos)
     if len(data) < 40:
         return None, None, None, None
     payload_len, next_header, hop_limit, src_addr, dst_addr = struct.unpack('! 4x H B B 16s 16s', data[:40])
@@ -74,15 +73,14 @@ def tcp_segment(data):
     return src_port, dest_port, data[offset:]
 
 def udp_segment(data):
+    # UDP Header is 8 bytes
     src_port, dest_port, size = struct.unpack('! H H 2x H', data[:8])
     return src_port, dest_port, data[8:]
 
-# --- Parsing de Aplicação (Heurísticas Avançadas) ---
+# --- Parsing de Aplicação ---
 
 def parse_dns_name(payload):
-    """Tenta extrair o domínio de uma query DNS."""
     try:
-        # Pula o cabeçalho DNS (12 bytes) e começa a ler o QNAME
         idx = 12
         domain = []
         while idx < len(payload):
@@ -97,10 +95,9 @@ def parse_dns_name(payload):
         return "Erro Parsing DNS"
 
 def parse_http_header(payload):
-    """Tenta extrair o método e host do HTTP."""
     try:
         text = payload.decode('utf-8', 'ignore').split('\r\n')
-        request_line = text[0] # Ex: GET /index.html HTTP/1.1
+        request_line = text[0] 
         host_line = [line for line in text if line.startswith("Host:")]
         host = host_line[0].split(": ")[1] if host_line else ""
         return f"{request_line} | Host: {host}"
@@ -111,6 +108,7 @@ def identify_app_protocol(src_port, dest_port, payload, timestamp):
     info = ""
     proto_name = "Other"
 
+    # Basic heuristic matching
     if src_port == 53 or dest_port == 53:
         proto_name = "DNS"
         info = f"Query/Resp: {parse_dns_name(payload)}"
@@ -129,7 +127,6 @@ def identify_app_protocol(src_port, dest_port, payload, timestamp):
         log_app(timestamp, proto_name, info)
         stats["app_protocols"][proto_name] += 1
     else:
-        # Tenta detectar HTTP em portas não padrão ou texto claro
         if b"HTTP" in payload[:20]:
             log_app(timestamp, "HTTP-Alt", parse_http_header(payload))
 
@@ -148,12 +145,9 @@ def log_transport(timestamp, proto_name, src, sport, dst, dport, size):
         csv.writer(f).writerow([timestamp, proto_name, src, sport, dst, dport, size])
 
 def update_client_stats(src_ip, dst_ip, dst_port, size):
-    """Atualiza estatísticas exigidas para os clientes do túnel."""
-    # Verifica se a origem é um cliente da rede 172.31.66.xxx
     if src_ip.startswith("172.31.66.") and src_ip != "172.31.66.1":
         client = src_ip
         remote = dst_ip
-    # Verifica se o destino é um cliente (tráfego de retorno)
     elif dst_ip.startswith("172.31.66.") and dst_ip != "172.31.66.1":
         client = dst_ip
         remote = src_ip
@@ -205,16 +199,18 @@ def print_ui():
 def main():
     init_csvs()
     
-    # Raw Socket capturando tudo (ETH_P_ALL = 0x0003)
+    # TUN interfaces operate on Layer 3 (IP). Regular ETH interfaces operate on Layer 2.
+    # Check if we are using a TUN interface.
+    IS_TUN = "tun" in INTERFACE
+
     try:
-        # socket.ntohs(3) garante que capturamos frames Ethernet recebidos
+        # 0x0003 is ETH_P_ALL
         conn = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(3))
         conn.bind((INTERFACE, 0))
     except Exception as e:
         print(f"Erro ao abrir socket na interface {INTERFACE}: {e}")
         return
 
-    # Thread da Interface
     t = threading.Thread(target=print_ui)
     t.daemon = True
     t.start()
@@ -226,58 +222,69 @@ def main():
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             packet_size = len(raw_data)
 
-            # Ethernet L2
-            eth_proto, data = ethernet_frame(raw_data)
-
-            # L3 Logica
-            src_ip, dst_ip, l4_proto, l4_payload = None, None, None, None
+            l4_proto, src_ip, dst_ip, data = None, None, None, None
             
-            # IPv4
-            if eth_proto == 8: 
-                stats["protocols"]["IPv4"] += 1
-                l4_proto, src_ip, dst_ip, data = ipv4_packet(data)
-                log_internet(timestamp, "IPv4", src_ip, dst_ip, l4_proto, "TTL/Header OK", packet_size)
-            
-            # IPv6
-            elif eth_proto == 0x86DD: 
-                stats["protocols"]["IPv6"] += 1
-                l4_proto, src_ip, dst_ip, data = ipv6_packet(data)
-                if src_ip: # Se o parsing funcionou
-                    log_internet(timestamp, "IPv6", src_ip, dst_ip, l4_proto, "Flow Label OK", packet_size)
+            # --- CAMADA 2 / 3 DECISION ---
+            # If TUN, the first byte is the IP Version. If ETH, it's the Dest MAC.
+            if IS_TUN:
+                # Skip Ethernet unpacking. raw_data IS the IP packet.
+                version = (raw_data[0] >> 4)
+                data = raw_data 
+                
+                if version == 4:
+                    stats["protocols"]["IPv4"] += 1
+                    l4_proto, src_ip, dst_ip, data = ipv4_packet(data)
+                    log_internet(timestamp, "IPv4", src_ip, dst_ip, l4_proto, "TTL/Header OK", packet_size)
+                elif version == 6:
+                    stats["protocols"]["IPv6"] += 1
+                    l4_proto, src_ip, dst_ip, data = ipv6_packet(data)
+                    if src_ip:
+                         log_internet(timestamp, "IPv6", src_ip, dst_ip, l4_proto, "Flow Label OK", packet_size)
+            else:
+                # Standard Ethernet (Layer 2) unpacking
+                eth_proto, data = ethernet_frame(raw_data)
 
-            # Se não extraímos IP, continuamos para o próximo
+                if eth_proto == 8: # IPv4
+                    stats["protocols"]["IPv4"] += 1
+                    l4_proto, src_ip, dst_ip, data = ipv4_packet(data)
+                    log_internet(timestamp, "IPv4", src_ip, dst_ip, l4_proto, "TTL/Header OK", packet_size)
+                elif eth_proto == 0x86DD: # IPv6
+                    stats["protocols"]["IPv6"] += 1
+                    l4_proto, src_ip, dst_ip, data = ipv6_packet(data)
+                    if src_ip:
+                        log_internet(timestamp, "IPv6", src_ip, dst_ip, l4_proto, "Flow Label OK", packet_size)
+
+            # If we couldn't parse IP, skip
             if not src_ip:
                 continue
 
-            # L4 Logica
+            # --- CAMADA 4 (Transporte) ---
+            # This logic remains the same, but now 'data' is correctly pointing 
+            # to the L4 header because IP parsing was done correctly.
+            
             src_port, dst_port = 0, 0
+            l4_payload = b""
             
             if l4_proto == 1: # ICMPv4
                 stats["protocols"]["ICMP"] += 1
                 ic_type, ic_code = icmp_packet(data)
-                # Atualiza log internet com detalhes ICMP
                 log_internet(timestamp, "ICMP", src_ip, dst_ip, 1, f"Type:{ic_type} Code:{ic_code}", packet_size)
             
             elif l4_proto == 6: # TCP
                 stats["protocols"]["TCP"] += 1
                 src_port, dst_port, l4_payload = tcp_segment(data)
                 log_transport(timestamp, "TCP", src_ip, src_port, dst_ip, dst_port, packet_size)
-                # Atualiza Stats do Cliente
                 update_client_stats(src_ip, dst_ip, dst_port, packet_size)
-                # Analisa Aplicação
                 identify_app_protocol(src_port, dst_port, l4_payload, timestamp)
 
             elif l4_proto == 17: # UDP
                 stats["protocols"]["UDP"] += 1
                 src_port, dst_port, l4_payload = udp_segment(data)
                 log_transport(timestamp, "UDP", src_ip, src_port, dst_ip, dst_port, packet_size)
-                # Atualiza Stats do Cliente
                 update_client_stats(src_ip, dst_ip, dst_port, packet_size)
-                # Analisa Aplicação
                 identify_app_protocol(src_port, dst_port, l4_payload, timestamp)
 
         except Exception:
-            # Captura erros de parsing para não derrubar o monitor
             continue
 
 if __name__ == "__main__":
